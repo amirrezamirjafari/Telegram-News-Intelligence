@@ -152,6 +152,7 @@ activemq-data/
 # Environments
 .env
 .envrc
+data/*.sqlite3
 .venv
 env/
 venv/
