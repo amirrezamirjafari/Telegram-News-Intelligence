@@ -4,7 +4,13 @@ import html
 from datetime import datetime
 from typing import Final
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    BotCommand,
+    BotCommandScopeChat,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -26,6 +32,22 @@ MARKETS: Final[tuple[tuple[str, str], ...]] = (
     ("macro", "اقتصاد کلان"),
 )
 
+OWNER_COMMANDS: Final[tuple[BotCommand, ...]] = (
+    BotCommand("status", "وضعیت ربات و خبرها"),
+    BotCommand("sources", "مدیریت منابع خبری"),
+    BotCommand("markets", "مدیریت بازارها"),
+    BotCommand("calendar", "رویدادهای اقتصادی امروز"),
+)
+
+
+async def publish_owner_commands(
+    application: Application, owner_chat_id: int
+) -> None:
+    await application.bot.set_my_commands(
+        OWNER_COMMANDS,
+        scope=BotCommandScopeChat(owner_chat_id),
+    )
+
 
 def register_handlers(application: Application) -> None:
     for command, handler in (
@@ -34,6 +56,7 @@ def register_handlers(application: Application) -> None:
         ("sources", sources_command),
         ("markets", markets_command),
         ("calendar", calendar_command),
+        ("calender", calendar_command),
         ("digest", digest_command),
         ("pause", pause_command),
         ("resume", resume_command),
@@ -55,7 +78,7 @@ async def start_command(
         "/sources — مدیریت منابع\n"
         "/markets — مدیریت بازارها\n"
         "/calendar — رویدادهای مهم امروز\n"
-        "/digest — ارسال فوری خلاصهٔ خبرهای کم‌تأثیر\n"
+        "/digest — ارسال فوری خلاصهٔ خبرهای کم‌تأثیر و متوسط\n"
         "/pause و /resume — توقف یا ادامهٔ پایش خودکار"
     )
 
@@ -74,7 +97,8 @@ async def status_command(
         f"<b>وضعیت پایش:</b> {'متوقف' if paused else 'فعال'}",
         f"<b>خبرهای ذخیره‌شده:</b> {counts.total}",
         f"<b>تحلیل‌شده:</b> {counts.processed}",
-        f"<b>کم‌تأثیر در انتظار digest:</b> {counts.deferred}",
+        f"<b>تحلیل‌های ناموفق (نیازمند بررسی):</b> {counts.failed_analysis}",
+        f"<b>خبرهای کم‌تأثیر و متوسط در انتظار digest:</b> {counts.deferred}",
         f"<b>ارسال‌شده در digest:</b> {counts.digest_delivered}",
         "<b>بر اساس بازار:</b>",
     ]
@@ -163,7 +187,9 @@ async def digest_command(
         return
     delivered = await send_deferred_digest(_store(context), _messages(context))
     if delivered == 0:
-        await _messages(context).put("خبر کم‌تأثیرِ آمادهٔ ارسال وجود ندارد.")
+        await _messages(context).put(
+            "خبر کم‌تأثیر یا متوسطِ آمادهٔ ارسال وجود ندارد."
+        )
 
 
 async def pause_command(

@@ -42,6 +42,23 @@ def format_analysis_message(
     safe_sentiment = _escape(SENTIMENT_LABELS[analysis.sentiment])
     safe_reasoning = _escape(analysis.reasoning_fa[:300])
     safe_impact = _escape(impact_label)
+    confidence_line = (
+        f"<b>ارزیابی اولیهٔ مدل (غیرکالیبره):</b> "
+        f"{analysis.confidence:.0%}"
+        if analysis.confidence is not None
+        else None
+    )
+    possible_impact_line = (
+        "<b>اثر احتمالی (سناریو، نه واقعیت یا سیگنال):</b> "
+        + _escape(analysis.possible_impact_fa[:700])
+        if analysis.possible_impact_fa is not None
+        else None
+    )
+    caveat_line = (
+        "<i>" + _escape(analysis.deep_caveat_fa[:300]) + "</i>"
+        if analysis.deep_caveat_fa is not None
+        else None
+    )
 
     safe_link = link[:2048]
     if _is_http_url(safe_link):
@@ -51,20 +68,28 @@ def format_analysis_message(
     else:
         link_line = _escape(safe_link)
 
-    return "\n".join(
+    lines = [
+        f"<b>{safe_title}</b>",
+        f"<b>بازار:</b> {safe_market}",
+        f"<b>منبع:</b> {safe_source} | <b>زمان انتشار:</b> {safe_time}",
+        f"<b>خلاصهٔ ماشینیِ تأییدنشده:</b> {safe_summary}",
+        f"<b>دارایی‌ها:</b> {safe_assets}",
+        f"<b>اثر اولیه:</b> {impact_emoji} {safe_impact}",
+        f"<b>احساس ذکرشده:</b> {safe_sentiment}",
+        f"<b>مبنای ارزیابی:</b> {safe_reasoning}",
+    ]
+    lines.extend(
+        line
+        for line in (confidence_line, possible_impact_line, caveat_line)
+        if line is not None
+    )
+    lines.extend(
         (
-            f"<b>{safe_title}</b>",
-            f"<b>بازار:</b> {safe_market}",
-            f"<b>منبع:</b> {safe_source} | <b>زمان انتشار:</b> {safe_time}",
-            f"<b>خلاصه:</b> {safe_summary}",
-            f"<b>دارایی‌ها:</b> {safe_assets}",
-            f"<b>اثر:</b> {impact_emoji} {safe_impact}",
-            f"<b>احساس بازار:</b> {safe_sentiment}",
-            f"<b>دلیل:</b> {safe_reasoning}",
             link_line,
-            "<i>این محتوا صرفاً جهت اطلاع‌رسانی است و توصیهٔ سرمایه‌گذاری نیست.</i>",
+            "<i>خبر و ترجمه مستقلاً راستی‌آزمایی نشده‌اند؛ تحلیل احتمالی است و توصیهٔ سرمایه‌گذاری نیست.</i>",
         )
     )
+    return "\n".join(lines)
 
 
 def _escape(value: str) -> str:

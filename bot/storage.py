@@ -51,6 +51,10 @@ class PendingStory:
     source_name: str
     market: str | None
     published_at: str | None
+    gemini_status: str
+    gemini_json: str | None
+    deepseek_status: str
+    deepseek_json: str | None
 
 
 @dataclass(frozen=True)
@@ -68,6 +72,7 @@ class DeferredStory:
 class StoryCounts:
     total: int
     pending_analysis: int
+    failed_analysis: int
     processed: int
     deferred: int
     digest_delivered: int
@@ -113,6 +118,10 @@ class StateStore:
                     published_at TEXT,
                     analysis_json TEXT,
                     analysis_status TEXT,
+                    gemini_status TEXT NOT NULL DEFAULT 'pending',
+                    gemini_json TEXT,
+                    deepseek_status TEXT NOT NULL DEFAULT 'pending',
+                    deepseek_json TEXT,
                     first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """
@@ -128,10 +137,19 @@ class StateStore:
                 "published_at",
                 "analysis_json",
                 "analysis_status",
+                "gemini_status",
+                "gemini_json",
+                "deepseek_status",
+                "deepseek_json",
             ):
                 if column not in story_columns:
+                    column_type = (
+                        "TEXT NOT NULL DEFAULT 'pending'"
+                        if column in {"gemini_status", "deepseek_status"}
+                        else "TEXT"
+                    )
                     await self._db.execute(
-                        f"ALTER TABLE seen_stories ADD COLUMN {column} TEXT"
+                        f"ALTER TABLE seen_stories ADD COLUMN {column} {column_type}"
                     )
             await self._db.execute(
                 """
@@ -139,6 +157,39 @@ class StateStore:
                 SET title = COALESCE(title, normalized_title),
                     link = COALESCE(link, normalized_url),
                     analysis_status = COALESCE(analysis_status, 'seeded')
+                """
+            )
+            await self._db.execute(
+                """
+                UPDATE seen_stories
+                SET gemini_status = 'skipped', deepseek_status = 'skipped'
+                WHERE analysis_status IN (
+                    'seeded', 'processed', 'deferred', 'digest_delivered'
+                )
+                  AND gemini_json IS NULL
+                  AND gemini_status = 'pending'
+                  AND deepseek_status = 'pending'
+                """
+            )
+            await self._db.execute(
+                """
+                UPDATE seen_stories
+                SET gemini_status = 'failed', analysis_status = 'failed'
+                WHERE gemini_status = 'in_progress'
+                """
+            )
+            await self._db.execute(
+                """
+                UPDATE seen_stories
+                SET deepseek_status = 'failed', analysis_status = 'failed'
+                WHERE deepseek_status = 'in_progress'
+                """
+            )
+            await self._db.execute(
+                """
+                UPDATE seen_stories
+                SET analysis_status = 'failed'
+                WHERE gemini_status = 'failed' OR deepseek_status = 'failed'
                 """
             )
             cursor = await self._db.execute("PRAGMA table_info(source_state)")
@@ -174,6 +225,16 @@ class StateStore:
                     actual TEXT,
                     forecast TEXT,
                     previous TEXT
+                )
+                """
+            )
+            await self._db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS provider_call_usage (
+                    provider TEXT NOT NULL,
+                    usage_date TEXT NOT NULL,
+                    calls INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (provider, usage_date)
                 )
                 """
             )
@@ -402,6 +463,7 @@ class StateStore:
                 """
                 SELECT COUNT(*),
                        SUM(CASE WHEN analysis_status = 'pending' THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN analysis_status = 'failed' THEN 1 ELSE 0 END),
                        SUM(CASE WHEN analysis_status = 'processed' THEN 1 ELSE 0 END),
                        SUM(CASE WHEN analysis_status = 'deferred' THEN 1 ELSE 0 END),
                        SUM(CASE WHEN analysis_status = 'digest_delivered' THEN 1 ELSE 0 END)
@@ -423,9 +485,10 @@ class StateStore:
             return StoryCounts(
                 total=int(counts[0] or 0),
                 pending_analysis=int(counts[1] or 0),
-                processed=int(counts[2] or 0),
-                deferred=int(counts[3] or 0),
-                digest_delivered=int(counts[4] or 0),
+                failed_analysis=int(counts[2] or 0),
+                processed=int(counts[3] or 0),
+                deferred=int(counts[4] or 0),
+                digest_delivered=int(counts[5] or 0),
                 by_market={row[0]: int(row[1]) for row in market_rows},
             )
 
@@ -550,8 +613,9 @@ class StateStore:
             INSERT OR IGNORE INTO seen_stories
                 (url_hash, title_hash, content_hash, normalized_url,
                  normalized_title, source_name, title, summary, link,
-                 market, published_at, analysis_status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 market, published_at, analysis_status,
+                 gemini_status, deepseek_status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 url_hash,
@@ -566,6 +630,8 @@ class StateStore:
                 market,
                 published_at,
                 analysis_status,
+                "skipped" if analysis_status == "seeded" else "pending",
+                "skipped" if analysis_status == "seeded" else "pending",
             ),
         )
         await db.commit()
@@ -576,9 +642,17 @@ class StateStore:
             cursor = await self._connection().execute(
                 """
                 SELECT url_hash, title, summary, link, source_name, market,
-                       published_at
+                       published_at, gemini_status, gemini_json,
+                       deepseek_status, deepseek_json
                 FROM seen_stories
                 WHERE analysis_status = 'pending'
+                  AND (
+                    gemini_status = 'pending'
+                    OR (
+                        gemini_status = 'completed'
+                        AND deepseek_status = 'pending'
+                    )
+                  )
                 ORDER BY first_seen_at, url_hash
                 """
             )
@@ -593,6 +667,10 @@ class StateStore:
                     source_name=row[4],
                     market=row[5],
                     published_at=row[6],
+                    gemini_status=row[7],
+                    gemini_json=row[8],
+                    deepseek_status=row[9],
+                    deepseek_json=row[10],
                 )
                 for row in rows
             ]
@@ -610,6 +688,112 @@ class StateStore:
                 (analysis_json, status, url_hash),
             )
             await self._connection().commit()
+
+    async def set_analysis_stage_status(
+        self, url_hash: str, stage: str, status: str
+    ) -> None:
+        if stage not in {"gemini", "deepseek"}:
+            raise ValueError("Unsupported analysis stage")
+        if status not in {"pending", "in_progress", "completed", "failed", "skipped"}:
+            raise ValueError("Unsupported analysis stage status")
+        async with self._db_lock:
+            await self._connection().execute(
+                f"""
+                UPDATE seen_stories
+                SET {stage}_status = ?,
+                    analysis_status = CASE
+                        WHEN ? = 'failed' THEN 'failed'
+                        ELSE analysis_status
+                    END
+                WHERE url_hash = ?
+                """,
+                (status, status, url_hash),
+            )
+            await self._connection().commit()
+
+    async def save_gemini_stage(
+        self,
+        url_hash: str,
+        assessment_json: str,
+        *,
+        deepseek_required: bool,
+        final_status: str | None = None,
+    ) -> None:
+        if final_status not in {None, "processed", "deferred"}:
+            raise ValueError("Unsupported final analysis status")
+        async with self._db_lock:
+            await self._connection().execute(
+                """
+                UPDATE seen_stories
+                SET gemini_json = ?, gemini_status = 'completed',
+                    deepseek_status = ?,
+                    analysis_json = CASE WHEN ? IS NULL THEN analysis_json ELSE ? END,
+                    analysis_status = CASE WHEN ? IS NULL THEN analysis_status ELSE ? END
+                WHERE url_hash = ?
+                """,
+                (
+                    assessment_json,
+                    "pending" if deepseek_required else "skipped",
+                    final_status,
+                    assessment_json if final_status is not None else None,
+                    final_status,
+                    final_status,
+                    url_hash,
+                ),
+            )
+            await self._connection().commit()
+
+    async def save_deepseek_stage(
+        self,
+        url_hash: str,
+        deepseek_json: str,
+        final_analysis_json: str,
+    ) -> None:
+        async with self._db_lock:
+            await self._connection().execute(
+                """
+                UPDATE seen_stories
+                SET deepseek_json = ?, deepseek_status = 'completed',
+                    analysis_json = ?, analysis_status = 'processed'
+                WHERE url_hash = ?
+                """,
+                (deepseek_json, final_analysis_json, url_hash),
+            )
+            await self._connection().commit()
+
+    async def reserve_daily_provider_call(self, provider: str, limit: int) -> bool:
+        if limit < 1:
+            raise ValueError("Provider call limit must be at least 1")
+        if provider not in {"deepseek"}:
+            raise ValueError("Unsupported daily call-budget provider")
+        from datetime import datetime, timezone
+
+        usage_date = datetime.now(timezone.utc).date().isoformat()
+        async with self._db_lock:
+            db = self._connection()
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                await db.execute(
+                    """
+                    INSERT OR IGNORE INTO provider_call_usage(provider, usage_date, calls)
+                    VALUES (?, ?, 0)
+                    """,
+                    (provider, usage_date),
+                )
+                cursor = await db.execute(
+                    """
+                    UPDATE provider_call_usage SET calls = calls + 1
+                    WHERE provider = ? AND usage_date = ? AND calls < ?
+                    """,
+                    (provider, usage_date, limit),
+                )
+                reserved = cursor.rowcount == 1
+                await cursor.close()
+                await db.commit()
+                return reserved
+            except Exception:
+                await db.rollback()
+                raise
 
     async def replace_calendar_events(
         self, events: Sequence[CalendarEvent]

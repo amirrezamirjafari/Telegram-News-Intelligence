@@ -40,8 +40,8 @@ def _parse_analysis(value: str) -> NewsAnalysis | None:
     except (TypeError, ValueError, json.JSONDecodeError):
         LOGGER.warning("Skipping a deferred story with invalid stored analysis")
         return None
-    if analysis.impact != "low":
-        LOGGER.warning("Skipping a deferred story that is not low impact")
+    if analysis.impact not in {"low", "medium"}:
+        LOGGER.warning("Skipping a deferred story that is not low or medium impact")
         return None
     return analysis
 
@@ -60,7 +60,7 @@ def _format_story_with_analysis(
 
 
 def _chunk_messages(items: list[str]) -> list[str]:
-    header = "<b>خلاصهٔ خبرهای کم‌تأثیر</b>"
+    header = "<b>خلاصهٔ خبرهای کم‌تأثیر و متوسط</b>"
     messages: list[str] = []
     current = header
     for item in items:

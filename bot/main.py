@@ -6,14 +6,14 @@ import logging
 from dotenv import load_dotenv
 from telegram.ext import Application, ApplicationBuilder
 
-from bot.analyzer import NewsAnalyzer
 from bot.calendar.feed import CalendarFeedClient
 from bot.calendar.notifications import enqueue_calendar_notifications
-from bot.commands import register_handlers
+from bot.commands import publish_owner_commands, register_handlers
 from bot.config import Settings
 from bot.fetchers.base import BaseFetcher
 from bot.fetchers.google_news import GoogleNewsFetcher
 from bot.fetchers.rss import RssFetcher
+from bot.pipeline import DeepSeekAnalyzer, GeminiAnalyzer, NewsPipeline
 from bot.scheduler import (
     OwnerMessageQueue,
     fetch_and_enqueue,
@@ -28,6 +28,7 @@ LOGGER = logging.getLogger(__name__)
 
 async def post_init(application: Application) -> None:
     settings: Settings = application.bot_data["settings"]
+    await publish_owner_commands(application, settings.owner_chat_id)
     settings.db_path.parent.mkdir(parents=True, exist_ok=True)
 
     store = StateStore(str(settings.db_path))
@@ -37,7 +38,21 @@ async def post_init(application: Application) -> None:
         "google_news": GoogleNewsFetcher(store),
     }
     messages = OwnerMessageQueue(application.bot, settings.owner_chat_id)
-    analyzer = NewsAnalyzer(settings.api_key, settings.model)
+    pipeline = NewsPipeline(
+        GeminiAnalyzer(
+            settings.gemini_api_key,
+            settings.gemini_model,
+            settings.gemini_max_output_tokens,
+        ),
+        DeepSeekAnalyzer(
+            settings.deepseek_api_key,
+            settings.deepseek_model,
+            settings.deepseek_max_output_tokens,
+            base_url=settings.deepseek_base_url,
+        ),
+        gemini_calls_per_cycle=settings.gemini_calls_per_cycle,
+        deepseek_daily_call_cap=settings.deepseek_daily_call_cap,
+    )
     calendar_feed_client = CalendarFeedClient(
         settings.calendar_feed_url,
         store,
@@ -45,13 +60,13 @@ async def post_init(application: Application) -> None:
     application.bot_data.update(
         state_store=store,
         fetchers=fetchers,
-        analyzer=analyzer,
+        news_pipeline=pipeline,
         calendar_feed_client=calendar_feed_client,
         owner_messages=messages,
         delivery_task=asyncio.create_task(messages.run()),
     )
 
-    await fetch_and_enqueue(fetchers, SOURCES, messages, store, analyzer)
+    await fetch_and_enqueue(fetchers, SOURCES, messages, store, pipeline)
     await refresh_calendar_feed(store, calendar_feed_client)
     await enqueue_calendar_notifications(
         store,
@@ -64,7 +79,7 @@ async def post_init(application: Application) -> None:
         SOURCES,
         messages,
         store,
-        analyzer,
+        pipeline,
         settings.fetch_interval_minutes,
         settings.timezone,
         calendar_feed_client,
@@ -94,9 +109,9 @@ async def post_shutdown(application: Application) -> None:
     for fetcher in fetchers.values():
         await fetcher.close()
 
-    analyzer: NewsAnalyzer | None = application.bot_data.get("analyzer")
-    if analyzer is not None:
-        await analyzer.close()
+    pipeline: NewsPipeline | None = application.bot_data.get("news_pipeline")
+    if pipeline is not None:
+        await pipeline.close()
 
     calendar_feed_client: CalendarFeedClient | None = application.bot_data.get(
         "calendar_feed_client"

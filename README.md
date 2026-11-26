@@ -3,15 +3,18 @@
 ## Current behavior
 
 The bot polls the editable feed list in `bot/sources.py`, silently seeds
-existing stories on its first complete fetch, filters irrelevant items,
-deduplicates across sources, and analyzes new stories. High- and medium-impact
-Persian analyses are sent only to `OWNER_CHAT_ID`; low-impact analyses are
-stored for a later digest. High-impact calendar events also get a reminder 30
-minutes before release, with actual results sent once when available. Owner-only
+existing stories on its first complete fetch, filters irrelevant items, and
+deduplicates across sources. Gemini translates/summarizes and scores each new
+story; only high-impact scores are sent to DeepSeek for a second, source-grounded
+possible-impact assessment. Low- and medium-impact stories are eligible for the
+existing digest. Every generated summary and inference is labelled unverified;
+the bot never presents model analysis as independently confirmed fact or a
+trading signal. High-impact calendar events also get a reminder 30 minutes
+before release, with actual results sent once when available. Owner-only
 commands are available; messages and callbacks from other chats are ignored.
-Per-feed ETag/Last-Modified values, calendar events, and notification state are
-stored in SQLite; a news feed is disabled after five consecutive failed polling
-cycles.
+Per-feed validators, analysis-stage results, provider-call usage, calendar
+events, and notification state are stored in SQLite; a news feed is disabled
+after five consecutive failed polling cycles.
 
 ## Setup
 
@@ -26,15 +29,23 @@ cp .env.example .env
 ```
 
 Set the required values in `.env`. The bot sends only filtered story titles and
-short feed summaries to the analyzer; it does not send source names, links, or
-full articles.
+short feed summaries to Gemini; DeepSeek receives only the original source
+title and short source summary for high-impact stories. Neither provider
+receives source names, links, or full articles.
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | Yes | — | Telegram bot token |
 | `OWNER_CHAT_ID` | Yes | — | Numeric ID of the only chat allowed to receive messages and use commands |
-| `API_KEY` | Yes | — | API key for the analyzer |
-| `MODEL` | No | `gpt-4o-mini` | Model sent in the OpenAI Chat Completions request |
+| `GEMINI_API_KEY` | Yes | — | Google Gemini API key |
+| `DEEPSEEK_API_KEY` | Yes | — | DeepSeek API key |
+| `GEMINI_MODEL` | No | `gemini-3.5-flash-lite` | Gemini translation and initial scoring model |
+| `DEEPSEEK_MODEL` | No | `manageit/deepseek-v4.1-flash` | DeepSeek high-impact follow-up model |
+| `DEEPSEEK_BASE_URL` | No | `https://ai.manageit.dev/api/v1` | OpenAI-compatible DeepSeek API base URL |
+| `GEMINI_CALLS_PER_CYCLE` | No | `20` | Maximum Gemini HTTP requests per feed poll |
+| `DEEPSEEK_DAILY_CALL_CAP` | No | `10` | Maximum DeepSeek HTTP requests per UTC day, enforced before each request |
+| `GEMINI_MAX_OUTPUT_TOKENS` | No | `512` | Per-request Gemini output cap |
+| `DEEPSEEK_MAX_OUTPUT_TOKENS` | No | `512` | Per-request DeepSeek output cap |
 | `FETCH_INTERVAL_MINUTES` | No | `10` | Feed polling interval |
 | `DIGEST_TIME` | No | `21:00` | Daily digest time in 24-hour `HH:MM` format |
 | `TIMEZONE` | No | `Asia/Tehran` | IANA timezone for the digest and calendar display |
@@ -42,9 +53,23 @@ full articles.
 | `CALENDAR_FEED_URL` | No | `https://nfs.faireconomy.media/ff_calendar_thisweek.json` | Candidate public weekly calendar JSON feed; verify provider availability and schema before production use |
 | `CALENDAR_REMINDER_MINUTES` | No | `30` | Minutes before a high-impact event to send a reminder |
 
-The analyzer currently sends OpenAI Chat Completions requests to the fixed
-endpoint `https://api.openai.com/v1/chat/completions`. `API_KEY` and `MODEL`
-are configurable; there is no configurable API base URL.
+Gemini uses the official `generateContent` REST API with a JSON response
+schema; DeepSeek uses Chat Completions JSON mode at
+`DEEPSEEK_BASE_URL/chat/completions`. Both requests have a
+30-second timeout and at most one retry for network errors or transient HTTP
+responses (429/5xx), with bounded backoff. Invalid response shapes or schemas
+are errors, not success-shaped fallbacks. Each stage is persisted so completed
+work is not billed again on later polls/restarts. A stage left in progress after
+a crash is marked failed on startup to avoid repeating a possibly billable
+request. Invalid JSON/schema responses get one bounded retry, budgeted as a
+separate request. Failed stages are excluded from automatic reprocessing and
+counted in `/status`; they require operator review rather than silent retries.
+
+The Gemini cap is per polling cycle (a retry uses another request slot). The
+DeepSeek cap is per UTC day and is reserved atomically before every request,
+including retries; if exhausted, high-impact work stays pending until the next
+day. These controls limit request volume and output tokens; actual spend also
+depends on current provider pricing and input-token rates.
 
 Run the bot from the repository root:
 
@@ -75,10 +100,11 @@ is a long-running worker; it does not serve HTTP traffic or require a public
 domain.
 
 1. Create a Railway project and deploy this repository as a service.
-2. In the service's Variables settings, configure the three required values
-   (`TELEGRAM_BOT_TOKEN`, `OWNER_CHAT_ID`, and `API_KEY`). Set optional values
-   from the table above only when you want to override their defaults. Do not
-   commit `.env` or put secret values in source control.
+2. In the service's Variables settings, configure the four required values
+   (`TELEGRAM_BOT_TOKEN`, `OWNER_CHAT_ID`, `GEMINI_API_KEY`, and
+   `DEEPSEEK_API_KEY`). Set optional values from the table above only when you
+   want to override their defaults. Do not commit `.env` or put secret values
+   in source control.
 3. Add a Railway Volume to the service and mount it at `/data`. Set
    `DB_PATH=/data/newsbot.sqlite3` in the service variables. The SQLite
    database contains deduplication state, source settings, calendar cache, and
@@ -111,16 +137,29 @@ for matching and are stored with retained titles and links, capped at 500
 characters; raw feed summaries are not sent to Telegram and full articles are
 never stored.
 
-## Milestone 4: Persian analysis and delivery
+## Milestone 4: two-stage Persian analysis and delivery
 
-The analyzer validates the required JSON fields and retries once when the
-response is malformed or has an invalid schema. It receives only each retained
-story's title and capped feed summary. High- and medium-impact analyses are
-formatted as escaped Telegram HTML and sent to the owner, including the source,
-published time, link, and financial disclaimer. Low-impact analyses are stored
-in SQLite with `deferred` status for a future digest; no digest is implemented
-in this milestone. Configure `DB_PATH` on a persistent volume to retain these
-analyses.
+After keyword filtering, deduplication, and silent initial seeding, Gemini
+returns a validated Persian summary, assets, sentiment, impact, reasoning, and
+self-reported confidence using the official structured `generateContent` API.
+Only high-impact items (the conservative definition of "important") proceed to
+DeepSeek. DeepSeek receives only the original source title and capped source
+summary—not Gemini's generated text—and returns a conditional possible-impact
+scenario plus an uncertainty caveat. Low- and medium-impact summaries are
+stored for the digest without DeepSeek calls.
+
+Both stages, their statuses, and outputs are persisted per story. Duplicate
+stories are discarded before provider calls; completed stages are not repeated
+after polling or restart. Transient network errors and HTTP 429/5xx responses
+receive at most one bounded retry. Invalid JSON, unsupported response shapes,
+and schema violations fail the stage explicitly without a success-shaped
+fallback. The Gemini request cap is per poll; DeepSeek requests are reserved
+atomically against a configurable UTC daily cap. Per-request output token
+limits further bound usage. Messages are escaped Telegram HTML, include source,
+time, and link, and state that translation and claims are unverified, the
+impact is a possible scenario, and the result is not a trading signal or
+investment advice. Configure `DB_PATH` on persistent storage to retain stage
+and deduplication state.
 
 ## Milestone 5: economic calendar
 
@@ -135,8 +174,10 @@ is included.
 ## Milestone 6: commands, settings, and digest
 
 The owner can use `/start`, `/status`, `/sources`, `/markets`, `/calendar`,
-`/digest`, `/pause`, and `/resume`. Source and market toggles, pause state, and
+`/digest`, `/pause`, and `/resume`. The typo alias `/calender` also opens the
+calendar. Status, sources, markets, and calendar commands are published in the
+owner's Telegram command menu. Source and market toggles, pause state, and
 digest delivery state persist in SQLite. `/pause` stops scheduled polling,
 calendar checks, and automatic digests while leaving owner commands available.
-The low-impact digest runs daily at `DIGEST_TIME` in `TIMEZONE`; `/digest`
-sends pending items immediately.
+The low- and medium-impact digest runs daily at `DIGEST_TIME` in `TIMEZONE`;
+`/digest` sends pending items immediately.

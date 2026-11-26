@@ -11,13 +11,13 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Bot, InlineKeyboardMarkup
 from telegram.error import TelegramError
 
-from bot.analyzer import AnalysisError, NewsAnalyzer
 from bot.calendar.feed import CalendarFeedClient
 from bot.calendar.notifications import enqueue_calendar_notifications
 from bot.classification import classify_entry
 from bot.digest import send_deferred_digest
 from bot.fetchers.base import BaseFetcher, FetchResult, Source
 from bot.formatter import format_analysis_message
+from bot.pipeline import NewsPipeline
 from bot.storage import StateStore
 
 LOGGER = logging.getLogger(__name__)
@@ -100,7 +100,7 @@ async def fetch_and_enqueue(
     sources: Sequence[Source],
     messages: OwnerMessageQueue,
     state_store: StateStore,
-    analyzer: NewsAnalyzer,
+    pipeline: NewsPipeline,
 ) -> None:
     if await state_store.is_paused():
         return
@@ -191,30 +191,7 @@ async def fetch_and_enqueue(
                 ),
                 analysis_status="pending",
             )
-    for story in await state_store.pending_stories():
-        try:
-            analysis = await analyzer.analyze(story.title, story.summary)
-        except AnalysisError as exc:
-            LOGGER.warning("Story analysis failed (%s)", type(exc).__name__)
-            continue
-
-        await state_store.save_analysis(
-            story.url_hash,
-            json.dumps(analysis.to_dict(), ensure_ascii=False),
-            "deferred" if analysis.impact == "low" else "processed",
-        )
-        if analysis.impact == "low":
-            continue
-
-        message = format_analysis_message(
-            title=story.title,
-            market=story.market,
-            source_name=story.source_name,
-            published_at=story.published_at,
-            analysis=analysis,
-            link=story.link,
-        )
-        await messages.put(message, parse_mode="HTML")
+    await pipeline.process_pending_stories(state_store, messages)
 
 
 def start_scheduler(
@@ -222,7 +199,7 @@ def start_scheduler(
     sources: Sequence[Source],
     messages: OwnerMessageQueue,
     state_store: StateStore,
-    analyzer: NewsAnalyzer,
+    pipeline: NewsPipeline,
     interval_minutes: int,
     timezone: tzinfo,
     calendar_feed_client: CalendarFeedClient | None = None,
@@ -234,7 +211,7 @@ def start_scheduler(
         fetch_and_enqueue,
         trigger="interval",
         minutes=interval_minutes,
-        args=[fetchers, sources, messages, state_store, analyzer],
+        args=[fetchers, sources, messages, state_store, pipeline],
         id="fetch-news-feeds",
         coalesce=True,
         max_instances=1,
@@ -247,7 +224,7 @@ def start_scheduler(
         minute=digest_minute,
         timezone=timezone,
         args=[state_store, messages],
-        id="daily-low-impact-digest",
+        id="daily-low-medium-digest",
         coalesce=True,
         max_instances=1,
     )

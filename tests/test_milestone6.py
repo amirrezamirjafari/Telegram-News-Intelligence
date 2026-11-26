@@ -9,6 +9,9 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 from zoneinfo import ZoneInfo
 
+from telegram import BotCommand, BotCommandScopeChat
+from telegram.ext import CommandHandler
+
 from bot.calendar.models import CalendarEvent
 from bot.calendar.notifications import enqueue_calendar_notifications
 from bot.commands import (
@@ -17,6 +20,7 @@ from bot.commands import (
     digest_command,
     markets_command,
     pause_command,
+    publish_owner_commands,
     register_handlers,
     resume_command,
     sources_command,
@@ -66,13 +70,13 @@ def make_update(chat_id: int) -> SimpleNamespace:
     return SimpleNamespace(effective_chat=SimpleNamespace(id=chat_id))
 
 
-def analysis_json() -> str:
+def analysis_json(impact: str = "low") -> str:
     return json.dumps(
         {
             "summary_fa": "خبر کم‌تأثیر است. واکنش بازار محدود ارزیابی می‌شود.",
             "assets": ["USD"],
             "sentiment": "neutral",
-            "impact": "low",
+            "impact": impact,
             "reasoning_fa": "داده‌ها اثر محدودی دارند.",
         },
         ensure_ascii=False,
@@ -173,6 +177,23 @@ class OwnerCommandTests(unittest.IsolatedAsyncioTestCase):
                 if store._db is not None:
                     await store.close()
 
+    async def test_owner_command_menu_is_published_with_chat_scope(self) -> None:
+        bot = SimpleNamespace(set_my_commands=AsyncMock())
+        application = SimpleNamespace(bot=bot)
+
+        await publish_owner_commands(application, owner_chat_id=123)  # type: ignore[arg-type]
+
+        bot.set_my_commands.assert_awaited_once()
+        commands = bot.set_my_commands.await_args.args[0]
+        scope = bot.set_my_commands.await_args.kwargs["scope"]
+        self.assertEqual(
+            [command.command for command in commands],
+            ["status", "sources", "markets", "calendar"],
+        )
+        self.assertIsInstance(commands[0], BotCommand)
+        self.assertIsInstance(scope, BotCommandScopeChat)
+        self.assertEqual(scope.chat_id, 123)
+
     async def test_persistent_toggles_change_the_fetch_pipeline(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(str(Path(directory) / "pipeline.sqlite3"))
@@ -234,10 +255,48 @@ class OwnerCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_handlers_are_registered(self) -> None:
         application = SimpleNamespace(add_handler=Mock())
         register_handlers(application)  # type: ignore[arg-type]
-        self.assertEqual(application.add_handler.call_count, 9)
+        self.assertEqual(application.add_handler.call_count, 10)
+        command_handlers = [
+            call.args[0]
+            for call in application.add_handler.call_args_list
+            if isinstance(call.args[0], CommandHandler)
+        ]
+        callbacks = {
+            command: handler.callback
+            for handler in command_handlers
+            for command in handler.commands
+        }
+        self.assertIs(callbacks["calendar"], calendar_command)
+        self.assertIs(callbacks["calender"], calendar_command)
 
 
 class DigestCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_medium_impact_analysis_is_eligible_for_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(str(Path(directory) / "medium-digest.sqlite3"))
+            await store.open()
+            sink = RecordingSink()
+            await store.record_story(
+                "Example",
+                "Medium impact story",
+                "https://example.com/medium-story",
+                market="macro",
+            )
+            cursor = await store._connection().execute(
+                "SELECT url_hash FROM seen_stories"
+            )
+            url_hash = (await cursor.fetchone())[0]
+            await cursor.close()
+            await store.save_analysis(
+                url_hash, analysis_json("medium"), "deferred"
+            )
+            try:
+                delivered = await send_deferred_digest(store, sink)
+                self.assertEqual(delivered, 1)
+                self.assertIn("Medium impact story", sink.items[0][0])
+            finally:
+                await store.close()
+
     async def test_manual_and_scheduled_digest_send_deferred_items_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(str(Path(directory) / "digest.sqlite3"))
@@ -295,7 +354,7 @@ class DigestCommandTests(unittest.IsolatedAsyncioTestCase):
                 digest_time="21:15",
             )
             try:
-                job = scheduler.get_job("daily-low-impact-digest")
+                job = scheduler.get_job("daily-low-medium-digest")
                 self.assertIsNotNone(job)
                 next_run = job.trigger.get_next_fire_time(
                     None, datetime.now(ZoneInfo("Asia/Tehran"))
