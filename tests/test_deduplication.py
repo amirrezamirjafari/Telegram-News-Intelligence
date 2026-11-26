@@ -7,6 +7,7 @@ from pathlib import Path
 
 from bot.analyzer import NewsAnalysis
 from bot.fetchers.base import FeedEntry, FetchResult, Source
+from bot.pipeline import DeepSeekAssessment, NewsPipeline
 from bot.scheduler import OwnerMessageQueue, fetch_and_enqueue
 from bot.storage import FAILURE_LIMIT, StateStore, normalize_url
 
@@ -31,19 +32,47 @@ class RecordingBot:
         self.parse_modes.append(parse_mode)
 
 
-class StaticAnalyzer:
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, str | None]] = []
+def make_pipeline(
+    calls: list[tuple[str, str | None]] | None = None,
+) -> NewsPipeline:
+    recorded_calls = calls if calls is not None else []
 
-    async def analyze(self, title: str, summary: str | None) -> NewsAnalysis:
-        self.calls.append((title, summary))
-        return NewsAnalysis(
-            summary_fa="خبر بر بازار اثر می‌گذارد. واکنش بازار را دنبال کنید.",
-            assets=("EUR/USD",),
-            sentiment="neutral",
-            impact="high",
-            reasoning_fa="خبر می‌تواند بر انتظارات نرخ بهره اثر بگذارد.",
-        )
+    class Gemini:
+        async def analyze(self, title: str, summary: str | None, budget: object) -> NewsAnalysis:
+            if not await budget():  # type: ignore[operator]
+                raise AssertionError("Gemini test budget should allow this request")
+            recorded_calls.append((title, summary))
+            return NewsAnalysis(
+                summary_fa="خبر بر بازار اثر می‌گذارد. واکنش بازار را دنبال کنید.",
+                assets=("EUR/USD",),
+                sentiment="neutral",
+                impact="high",
+                reasoning_fa="خبر می‌تواند بر انتظارات نرخ بهره اثر بگذارد.",
+                confidence=0.8,
+            )
+
+        async def close(self) -> None:
+            return None
+
+    class DeepSeek:
+        async def analyze(self, title: str, summary: str | None, budget: object) -> DeepSeekAssessment:
+            if not await budget():  # type: ignore[operator]
+                raise AssertionError("DeepSeek test budget should allow this request")
+            return DeepSeekAssessment(
+                "ممکن است در صورت تأیید منبع، واکنش ایجاد شود.",
+                0.6,
+                "این سناریو تأییدنشده و سیگنال معاملاتی نیست.",
+            )
+
+        async def close(self) -> None:
+            return None
+
+    return NewsPipeline(
+        Gemini(),  # type: ignore[arg-type]
+        DeepSeek(),  # type: ignore[arg-type]
+        gemini_calls_per_cycle=20,
+        deepseek_daily_call_cap=10,
+    )
 
 
 class StoryDeduplicationTests(unittest.IsolatedAsyncioTestCase):
@@ -67,17 +96,18 @@ class StoryDeduplicationTests(unittest.IsolatedAsyncioTestCase):
             bot = RecordingBot()
             queue = OwnerMessageQueue(bot, owner_chat_id=123)
             delivery_task = asyncio.create_task(queue.run(interval_seconds=0))
-            analyzer = StaticAnalyzer()
+            analyzer_calls: list[tuple[str, str | None]] = []
+            pipeline = make_pipeline(analyzer_calls)
             try:
                 await fetch_and_enqueue(
                     {"rss": fetcher},
                     (source,),
                     queue,
                     store,  # type: ignore[arg-type]
-                    analyzer,  # type: ignore[arg-type]
+                    pipeline,
                 )
                 self.assertEqual(bot.messages, [])
-                self.assertEqual(analyzer.calls, [])
+                self.assertEqual(analyzer_calls, [])
                 self.assertTrue(await store.seed_complete())
                 cursor = await store._connection().execute(
                     "SELECT summary FROM seen_stories WHERE link = ?",
@@ -104,7 +134,7 @@ class StoryDeduplicationTests(unittest.IsolatedAsyncioTestCase):
                     (source,),
                     queue,
                     store,  # type: ignore[arg-type]
-                    analyzer,  # type: ignore[arg-type]
+                    pipeline,
                 )
                 await queue.stop()
 
@@ -155,7 +185,7 @@ class StoryDeduplicationTests(unittest.IsolatedAsyncioTestCase):
                     (source_a, source_b),
                     queue,
                     store,  # type: ignore[arg-type]
-                    StaticAnalyzer(),  # type: ignore[arg-type]
+                    make_pipeline(),
                 )
                 self.assertFalse(await store.seed_complete())
                 self.assertEqual(bot.messages, [])
@@ -173,7 +203,7 @@ class StoryDeduplicationTests(unittest.IsolatedAsyncioTestCase):
                     (source_a, source_b),
                     queue,
                     store,  # type: ignore[arg-type]
-                    StaticAnalyzer(),  # type: ignore[arg-type]
+                    make_pipeline(),
                 )
                 self.assertTrue(await store.seed_complete())
                 self.assertEqual(bot.messages, [])
@@ -206,7 +236,7 @@ class StoryDeduplicationTests(unittest.IsolatedAsyncioTestCase):
                     (source,),
                     queue,
                     store,  # type: ignore[arg-type]
-                    StaticAnalyzer(),  # type: ignore[arg-type]
+                    make_pipeline(),
                 )
                 self.assertTrue(await store.seed_complete())
                 self.assertEqual(bot.messages, [])
@@ -216,14 +246,14 @@ class StoryDeduplicationTests(unittest.IsolatedAsyncioTestCase):
                     (source,),
                     queue,
                     store,  # type: ignore[arg-type]
-                    StaticAnalyzer(),  # type: ignore[arg-type]
+                    make_pipeline(),
                 )
                 await fetch_and_enqueue(
                     {"rss": fetcher},
                     (source,),
                     queue,
                     store,  # type: ignore[arg-type]
-                    StaticAnalyzer(),  # type: ignore[arg-type]
+                    make_pipeline(),
                 )
                 await queue.stop()
 
