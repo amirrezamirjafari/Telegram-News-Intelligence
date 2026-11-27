@@ -41,7 +41,8 @@ async def enqueue_calendar_notifications(
             )
 
         if (
-            current_time >= event.event_at
+            event.impact in {"high", "medium"}
+            and current_time >= event.event_at
             and event.actual is not None
             and await state_store.claim_calendar_notification(event.event_id, "actual")
         ):
