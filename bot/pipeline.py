@@ -420,7 +420,7 @@ class NewsPipeline:
                     story.url_hash, "deepseek", "pending"
                 )
                 LOGGER.info("DeepSeek daily call cap reached")
-                break
+                continue
             except (AnalysisError, InvalidAnalysisResponse) as exc:
                 await store.set_analysis_stage_status(
                     story.url_hash, "deepseek", "failed"
